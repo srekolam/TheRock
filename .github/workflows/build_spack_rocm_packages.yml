@@ -1,0 +1,260 @@
+name: Build Spack ROCm Packages
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'stage/docker/**'
+    paths:
+      - dockerfiles/spack_ubuntu24_04.Dockerfile
+      - .github/workflows/build_spack_rocm_packages.yml
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Force Docker build even if no changes detected"
+        type: boolean
+        default: false
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  track_and_build:
+    name: Track ROCm Submodules & Build Spack Image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CACHE_DIR: ${{ github.workspace }}/.cache
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ROCm/spack_ubuntu24_04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Python
+        uses: actions/setup-python@8ccefebd84d7e54c90cc7c0348d0ed77f8cf4e72 # v6.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Create Cache Directory
+        run: |
+          mkdir -p "$CACHE_DIR"
+
+      - name: Check ROCm Submodule Commits for Updates
+        id: check_updates
+        run: |
+          set -euo pipefail
+
+          # Get the commit SHAs that TheRock project is pinned to for submodules
+          cd "${{ github.workspace }}/.."
+
+          rocm_systems_commit=$(git ls-tree HEAD rocm-systems | awk '{print $3}')
+          rocm_libraries_commit=$(git ls-tree HEAD rocm-libraries | awk '{print $3}')
+          amd_llvm_commit=$(git ls-tree HEAD compiler/amd-llvm | awk '{print $3}')
+          hipify_commit=$(git ls-tree HEAD compiler/hipify | awk '{print $3}')
+          spirv_translator_commit=$(git ls-tree HEAD compiler/spirv-llvm-translator | awk '{print $3}')
+
+          echo "Current submodule commits:"
+          echo "  rocm-systems: $rocm_systems_commit"
+          echo "  rocm-libraries: $rocm_libraries_commit"
+          echo "  amd-llvm: $amd_llvm_commit"
+          echo "  hipify: $hipify_commit"
+          echo "  spirv-llvm-translator: $spirv_translator_commit"
+
+          echo "rocm_systems_commit=$rocm_systems_commit" >> $GITHUB_OUTPUT
+          echo "rocm_libraries_commit=$rocm_libraries_commit" >> $GITHUB_OUTPUT
+          echo "amd_llvm_commit=$amd_llvm_commit" >> $GITHUB_OUTPUT
+          echo "hipify_commit=$hipify_commit" >> $GITHUB_OUTPUT
+          echo "spirv_translator_commit=$spirv_translator_commit" >> $GITHUB_OUTPUT
+
+          # Check cached commits
+          changes_detected=false
+
+          # Function to check for changes
+          check_submodule_change() {
+            local name=$1
+            local current_commit=$2
+            local cache_file="$CACHE_DIR/${name}_commit.txt"
+
+            if [ -f "$cache_file" ]; then
+              cached_commit=$(cat "$cache_file")
+              if [ "$cached_commit" != "$current_commit" ]; then
+                echo "$name submodule updated: $cached_commit -> $current_commit"
+                return 0  # Changed
+              fi
+            else
+              echo "No cached commit for $name, marking as changed"
+              return 0  # Changed
+            fi
+            return 1  # Not changed
+          }
+
+          if check_submodule_change "rocm_systems" "$rocm_systems_commit"; then
+            changes_detected=true
+          fi
+
+          if check_submodule_change "rocm_libraries" "$rocm_libraries_commit"; then
+            changes_detected=true
+          fi
+
+          if check_submodule_change "amd_llvm" "$amd_llvm_commit"; then
+            changes_detected=true
+          fi
+
+          if check_submodule_change "hipify" "$hipify_commit"; then
+            changes_detected=true
+          fi
+
+          if check_submodule_change "spirv_translator" "$spirv_translator_commit"; then
+            changes_detected=true
+          fi
+
+          if [ "${{ inputs.force_build }}" == "true" ]; then
+            echo "Force build enabled"
+            changes_detected=true
+          fi
+
+          echo "changes_detected=$changes_detected" >> $GITHUB_OUTPUT
+
+      - name: Check if Dockerfile Changed
+        id: dockerfile_check
+        run: |
+          # Check if this run was triggered by a Dockerfile change
+          if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q "dockerfiles/spack_ubuntu24_04.Dockerfile"; then
+            echo "dockerfile_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "dockerfile_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine if Build is Needed
+        id: build_check
+        run: |
+          if [ "${{ steps.check_updates.outputs.changes_detected }}" == "true" ] || \
+             [ "${{ steps.dockerfile_check.outputs.dockerfile_changed }}" == "true" ] || \
+             [ "${{ inputs.force_build }}" == "true" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "Build triggered"
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "No build needed"
+          fi
+
+      - name: Create Metadata Artifact
+        if: steps.check_updates.outputs.changes_detected == 'true'
+        run: |
+          mkdir -p artifacts
+
+          # Create metadata file
+          cat > artifacts/sync-metadata.json <<EOF
+          {
+            "sync_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "therock_submodules": {
+              "rocm_systems_commit": "${{ steps.check_updates.outputs.rocm_systems_commit }}",
+              "rocm_libraries_commit": "${{ steps.check_updates.outputs.rocm_libraries_commit }}",
+              "amd_llvm_commit": "${{ steps.check_updates.outputs.amd_llvm_commit }}",
+              "hipify_commit": "${{ steps.check_updates.outputs.hipify_commit }}",
+              "spirv_translator_commit": "${{ steps.check_updates.outputs.spirv_translator_commit }}"
+            }
+          }
+          EOF
+
+          cat artifacts/sync-metadata.json
+
+      - name: Upload Metadata Artifact
+        if: steps.check_updates.outputs.changes_detected == 'true'
+        uses: actions/upload-artifact@8f3b97da7c0d729efa9c1d4e0fae2fe3b3e0bf32 # v6.0.0
+        with:
+          name: rocm-submodule-metadata-${{ github.run_id }}
+          path: artifacts/sync-metadata.json
+          retention-days: 30
+
+      - name: Update Cache
+        if: steps.check_updates.outputs.changes_detected == 'true'
+        run: |
+          echo "${{ steps.check_updates.outputs.rocm_systems_commit }}" > "$CACHE_DIR/rocm_systems_commit.txt"
+          echo "${{ steps.check_updates.outputs.rocm_libraries_commit }}" > "$CACHE_DIR/rocm_libraries_commit.txt"
+          echo "${{ steps.check_updates.outputs.amd_llvm_commit }}" > "$CACHE_DIR/amd_llvm_commit.txt"
+          echo "${{ steps.check_updates.outputs.hipify_commit }}" > "$CACHE_DIR/hipify_commit.txt"
+          echo "${{ steps.check_updates.outputs.spirv_translator_commit }}" > "$CACHE_DIR/spirv_translator_commit.txt"
+          echo "Cache updated with latest commit SHAs"
+
+      - name: Log in to Container Registry
+        if: steps.build_check.outputs.should_build == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine Docker Tag
+        if: steps.build_check.outputs.should_build == 'true'
+        id: tag
+        run: |
+          ref="${{ github.ref_name }}"
+          if [[ "$ref" == stage/docker/* ]]; then
+            suffix="${ref#stage/docker/}"
+            echo "TAG_SUFFIX=stage-${suffix}" >> "$GITHUB_OUTPUT"
+          elif [[ "$ref" == "main" ]]; then
+            echo "TAG_SUFFIX=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "TAG_SUFFIX=${ref}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract Metadata for Docker
+        if: steps.build_check.outputs.should_build == 'true'
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=schedule
+            type=ref,event=branch,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=ref,event=pr
+            type=raw,value=${{ steps.tag.outputs.TAG_SUFFIX }}
+
+      - name: Build and Push Docker Image
+        if: steps.build_check.outputs.should_build == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: dockerfiles/
+          file: dockerfiles/spack_ubuntu24_04.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Report Summary
+        if: always()
+        run: |
+          echo "## ROCm Submodule Tracking"
+          if [ "${{ steps.check_updates.outputs.changes_detected }}" == "true" ]; then
+            echo "✅ Changes detected in ROCm submodules"
+            echo "Monitored submodule commits:"
+            echo "  - rocm-systems: ${{ steps.check_updates.outputs.rocm_systems_commit }}"
+            echo "  - rocm-libraries: ${{ steps.check_updates.outputs.rocm_libraries_commit }}"
+            echo "  - amd-llvm: ${{ steps.check_updates.outputs.amd_llvm_commit }}"
+            echo "  - hipify: ${{ steps.check_updates.outputs.hipify_commit }}"
+            echo "  - spirv-llvm-translator: ${{ steps.check_updates.outputs.spirv_translator_commit }}"
+            echo ""
+            echo "Metadata artifact: rocm-submodule-metadata-${{ github.run_id }}"
+          else
+            echo "ℹ️ No changes detected in monitored submodules"
+          fi
+
+          echo ""
+          echo "## Docker Image Build"
+          if [ "${{ steps.build_check.outputs.should_build }}" == "true" ]; then
+            echo "✅ Docker image built and pushed"
+            echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          else
+            echo "⏭️ Docker build skipped (no changes detected)"
+          fi
