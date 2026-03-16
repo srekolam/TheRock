@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
 """Helper script to bump TheRock's submodules, doing the following:
  * (Optional) Creates a new branch
  * Updates submodules from remote using `fetch_sources.py`
@@ -62,11 +65,6 @@ def parse_components(components: list[str]) -> list[list]:
             "rocm-cmake",
         ]
 
-    if "profiler" in components:
-        system_projects += [
-            "rocprof-trace-decoder",
-        ]
-
     if "rocm-libraries" in components:
         arguments.append("--include-rocm-libraries")
         arguments.append("--include-ml-frameworks")
@@ -98,10 +96,10 @@ def parse_components(components: list[str]) -> list[list]:
     else:
         arguments.append("--no-include-debug-tools")
 
-    if "rocm-media" in components:
-        arguments.append("--include-rocm-media")
+    if "media-libs" in components:
+        arguments.append("--include-media-libs")
     else:
-        arguments.append("--no-include-rocm-media")
+        arguments.append("--no-include-media-libs")
 
     if "math-libraries" in components:
         arguments.append("--include-math-libraries")
@@ -197,7 +195,7 @@ def main(argv):
                   profiler,
                   iree-libs,
                   debug-tools,
-                  rocm-media,
+                  media-libs,
                   math-libraries
              """,
     )
