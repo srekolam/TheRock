@@ -5,12 +5,13 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install essential packages
+# Install all system dependencies in one layer
 RUN apt-get update -y && apt-get install -y \
     sudo \
     curl \
     wget \
     git \
+    jq \
     python3 \
     python3-pip \
     python3-setuptools \
@@ -27,84 +28,48 @@ RUN apt-get update -y && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Create spack user with sudo privileges
-RUN useradd -m -s /bin/bash -U -G sudo spack
-RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+# Create spack user with passwordless sudo
+RUN useradd -m -s /bin/bash -U -G sudo spack && \
+    echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
-# Switch to spack user
 USER spack
 WORKDIR /home/spack
 
-# Set environment variables for Spack
-ENV SPACK_ROOT=/home/spack/spack
+ENV SPACK_ROOT=/home/spack/spack \
+    SPACK_ENV_NAME=rocm
 ENV PATH="${SPACK_ROOT}/bin:${PATH}"
 
-# Clone Spack repository
-RUN git clone --depth 1 https://github.com/spack/spack.git ${SPACK_ROOT}
+# Clone Spack and the ROCm package repository
+RUN git clone --depth 1 https://github.com/spack/spack.git ${SPACK_ROOT} && \
+    git clone --depth 1 https://github.com/ROCm/rocm-spack-packages.git /home/spack/spack-packages
 
-# Clone Spack packages repository (custom package repository)
-RUN git clone --depth 1 https://github.com/spack/spack-packages.git /home/spack/spack-packages
-
-# Initialize Spack
+# Bootstrap Spack: detect compilers and register the ROCm package repo
 RUN . ${SPACK_ROOT}/share/spack/setup-env.sh && \
-    spack compiler find
+    spack compiler find && \
+    spack repo add /home/spack/spack-packages
 
-# Add spack-packages as a repository
+# Create the named environment and install all ROCm-tagged packages
+COPY --chown=spack:spack rocm-spack-env/spack.yaml /home/spack/rocm-spack-env/spack.yaml
 RUN . ${SPACK_ROOT}/share/spack/setup-env.sh && \
-    spack repo add /home/spack/spack-packages || true
+    spack env create ${SPACK_ENV_NAME} /home/spack/rocm-spack-env/spack.yaml && \
+    spack env activate ${SPACK_ENV_NAME} && \
+    spack list -t rocm | tail -n +2 | tr '  ' '\n' | grep -v '^$' | \
+        xargs -I{} spack add {} && \
+    spack concretize -f && \
+    spack install --fail-fast
 
-# Create directory for ROCm submodule metadata
+# Activate the environment for interactive sessions
+RUN echo ". ${SPACK_ROOT}/share/spack/setup-env.sh" >> /home/spack/.bashrc && \
+    echo "spack env activate ${SPACK_ENV_NAME}" >> /home/spack/.bashrc
+
+# Create directory and helper script for ROCm submodule metadata
 RUN mkdir -p /home/spack/rocm-metadata
-
-# Create a helper script to update Spack repos from sync artifacts
-RUN cat > /home/spack/update_spack_from_metadata.sh <<'EOF'
-#!/bin/bash
-set -euo pipefail
-
-METADATA_FILE="${1:-/home/spack/rocm-metadata/sync-metadata.json}"
-
-if [ ! -f "$METADATA_FILE" ]; then
-    echo "Error: Metadata file not found: $METADATA_FILE"
-    exit 1
-fi
-
-echo "Reading metadata from: $METADATA_FILE"
-
-# Extract commit information
-ROCM_SYSTEMS_COMMIT=$(jq -r '.therock_submodules.rocm_systems_commit' "$METADATA_FILE")
-ROCM_LIBRARIES_COMMIT=$(jq -r '.therock_submodules.rocm_libraries_commit' "$METADATA_FILE")
-AMD_LLVM_COMMIT=$(jq -r '.therock_submodules.amd_llvm_commit' "$METADATA_FILE")
-HIPIFY_COMMIT=$(jq -r '.therock_submodules.hipify_commit' "$METADATA_FILE")
-SPIRV_TRANSLATOR_COMMIT=$(jq -r '.therock_submodules.spirv_translator_commit' "$METADATA_FILE")
-
-echo "TheRock submodule commits:"
-echo "  rocm-systems: $ROCM_SYSTEMS_COMMIT"
-echo "  rocm-libraries: $ROCM_LIBRARIES_COMMIT"
-echo "  amd-llvm: $AMD_LLVM_COMMIT"
-echo "  hipify: $HIPIFY_COMMIT"
-echo "  spirv-llvm-translator: $SPIRV_TRANSLATOR_COMMIT"
-
-# Save commits to individual files for easy access
-echo "$ROCM_SYSTEMS_COMMIT" > /home/spack/rocm-metadata/rocm_systems_commit.txt
-echo "$ROCM_LIBRARIES_COMMIT" > /home/spack/rocm-metadata/rocm_libraries_commit.txt
-echo "$AMD_LLVM_COMMIT" > /home/spack/rocm-metadata/amd_llvm_commit.txt
-echo "$HIPIFY_COMMIT" > /home/spack/rocm-metadata/hipify_commit.txt
-echo "$SPIRV_TRANSLATOR_COMMIT" > /home/spack/rocm-metadata/spirv_translator_commit.txt
-
-echo "Metadata processed successfully!"
-EOF
-
+COPY --chown=spack:spack rocm-spack-env/update_spack_from_metadata.sh /home/spack/update_spack_from_metadata.sh
 RUN chmod +x /home/spack/update_spack_from_metadata.sh
 
-# Install jq for JSON parsing
-USER root
-RUN apt-get update -y && apt-get install -y jq && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-USER spack
+# Entrypoint activates the spack environment for all commands
+COPY --chown=spack:spack rocm-spack-env/entrypoint.sh /home/spack/entrypoint.sh
+RUN chmod +x /home/spack/entrypoint.sh
 
-# Source Spack in bashrc for convenience
-RUN echo ". ${SPACK_ROOT}/share/spack/setup-env.sh" >> /home/spack/.bashrc
-
-# Set default command
+ENTRYPOINT ["/home/spack/entrypoint.sh"]
 CMD ["/bin/bash"]
