@@ -23,6 +23,14 @@ spack:
         environment: {}
         extra_rpaths: []
 
+  concretizer:
+    reuse: true
+
+  mirrors:
+    spack-public:
+      url: https://binaries.spack.io/releases/latest
+      signed: false
+
   config:
     install_tree:
       root: /home/spack/spack-install

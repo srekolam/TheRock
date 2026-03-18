@@ -55,6 +55,7 @@ RUN . ${SPACK_ROOT}/share/spack/setup-env.sh && \
     spack env activate ${SPACK_ENV_NAME} && \
     spack list -t rocm | tail -n +2 | tr '  ' '\n' | grep -v '^$' | \
         xargs -I{} spack add {} && \
+    spack buildcache keys --install --trust && \
     spack concretize -f && \
     spack install --fail-fast
 
